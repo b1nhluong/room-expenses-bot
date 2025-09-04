@@ -27,14 +27,14 @@ def init_db():
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       chat_id INTEGER NOT NULL,
       name TEXT NOT NULL,            -- người trả (tên đầy đủ)
-      amount_k INTEGER NOT NULL,     -- nghìn VND
+      amount_k INTEGER NOT NULL,     -- nghìn VND (đơn vị 'k')
       note TEXT,
-      participants TEXT,             -- ví dụ "a,b" (chữ cái của người cùng chia)
+      participants TEXT,             -- ví dụ "a,b" (các chữ cái tham gia chia); None = chia tất cả
       ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
     con.execute("""CREATE TABLE IF NOT EXISTS settings(
       chat_id INTEGER PRIMARY KEY,
-      period_start TEXT
+      period_start TEXT              -- ISO timestamp
     )""")
     con.execute("""CREATE TABLE IF NOT EXISTS name_map(
       chat_id INTEGER NOT NULL,
@@ -42,14 +42,14 @@ def init_db():
       fullname TEXT NOT NULL,        -- 'Bình','An','Duy'
       PRIMARY KEY(chat_id, initial)
     )""")
-    # đảm bảo cột participants tồn tại (nâng cấp DB cũ)
+    # Nâng cấp DB cũ nếu thiếu cột participants
     try:
         con.execute("ALTER TABLE expenses ADD COLUMN participants TEXT")
     except sqlite3.OperationalError:
         pass
     con.commit(); con.close()
 
-def get_period_start(chat_id: int):
+def get_period_start(chat_id: int) -> datetime:
     con = db(); cur = con.cursor()
     cur.execute("SELECT period_start FROM settings WHERE chat_id=?", (chat_id,))
     row = cur.fetchone()
@@ -75,6 +75,7 @@ def clear_expenses(chat_id: int):
     con.commit(); con.close()
 
 def set_default_map(chat_id: int):
+    """Nếu chưa có map, tạo mặc định: b->Bình; a->An; d->Duy."""
     con = db(); cur = con.cursor()
     cur.execute("SELECT COUNT(1) FROM name_map WHERE chat_id=?", (chat_id,))
     if cur.fetchone()[0] == 0:
@@ -107,7 +108,7 @@ def set_mapping(chat_id: int, pairs: list[tuple[str,str]]):
                     (chat_id, ini.lower(), full.strip()))
     con.commit(); con.close()
 
-# === Parse helpers (chỉ dùng token nhóm, KHÔNG còn "| ..") ===
+# === Parse helpers (chỉ dùng token nhóm, KHÔNG hỗ trợ "| ...") ===
 # Ví dụ: /ab 200 trua  | /b 120 sieu thi  | /bcd 300 gas
 ENTRY_CMD_RE = re.compile(r"^/([a-zA-Z]{1,20})\s+(-?\d[\d.,]*)\s*(k|K)?\s*(.*)$")
 
@@ -138,12 +139,21 @@ def parse_entry_group_token(text: str):
 def fmt_k(nk: int): return f"{nk}k"
 def fmt_date_dmy(dt: datetime): return dt.astimezone().strftime("%d-%m-%Y")
 
-# === Tính cân bằng theo từng khoản (hỗ trợ nhóm con) ===
+# === Tính toán: tổng chi, net, và "chi riêng theo cặp (payer, other)" ===
 def compute_balances(chat_id: int, start_iso: str):
-    members_map = list_members(chat_id)            # 'b'->'Bình'
-    members_order = list(members_map.values())
+    """
+    Trả về:
+      - paid_sum: tổng (k) mỗi người đã TRẢ
+      - net: số dư (k) sau khi chia (dương = được nhận, âm = phải trả)
+      - members_order: danh sách tên đầy đủ theo map (để in ổn định, alphabet)
+      - pair_spent_by_payer: dict[(payer, other)] = tổng (k) mà payer đã chi riêng cho CẶP (payer, other)
+                             (chỉ tính khoản có đúng 2 người tham gia và payer thuộc cặp)
+    """
+    members_map = list_members(chat_id)            # 'a'->'An', ...
+    members_order = sorted(members_map.values())   # in theo alphabet cho dễ đọc
     paid_sum = {name: 0 for name in members_order}
     net = {name: 0.0 for name in members_order}
+    pair_spent_by_payer = {}  # key=(payer_full, other_full) -> amount_k
 
     con = db(); cur = con.cursor()
     cur.execute("""SELECT name, amount_k, note, participants
@@ -153,42 +163,56 @@ def compute_balances(chat_id: int, start_iso: str):
     rows = cur.fetchall(); con.close()
 
     if not rows:
-        return paid_sum, net, members_order
+        return paid_sum, net, members_order, pair_spent_by_payer
 
     for name, amount_k, _note, participants in rows:
         amount_k = int(amount_k or 0)
+
+        # đảm bảo có key cho payer
         if name not in paid_sum:
             paid_sum[name] = 0
             net[name] = 0.0
             if name not in members_order:
                 members_order.append(name)
+
+        # payer ứng trước
         paid_sum[name] += amount_k
         net[name] += amount_k
 
-        if participants:  # có nhóm con
+        # xác định tập S tham gia chia
+        members_map_now = list_members(chat_id)  # reload để map mới vẫn dùng được
+        if participants:
             inis = [s.strip().lower() for s in participants.split(",") if s.strip()]
             S = []
             for ch in inis:
-                full = members_map.get(ch)
+                full = members_map_now.get(ch)
                 if full:
                     if full not in net:
                         net[full] = 0.0
                         if full not in members_order:
                             members_order.append(full)
                     S.append(full)
-            if not S:  # nếu toàn ký tự lạ → fallback tất cả
-                S = members_order
+            if not S:
+                S = members_order  # fallback tất cả nếu ký tự lạ
         else:
-            S = members_order  # mặc định tất cả
+            S = members_order     # mặc định tất cả
 
+        # cấn trừ vào net theo chia đều
         if len(S) > 0:
             share = amount_k / float(len(S))
             for full in S:
                 net[full] -= share
 
-    return paid_sum, net, members_order
+        # Ghi sổ "chi riêng theo cặp" nếu khoản này chỉ có đúng 2 người tham gia và payer thuộc cặp
+        if len(S) == 2 and name in S:
+            other = S[0] if S[1] == name else S[1]
+            key = (name, other)
+            pair_spent_by_payer[key] = pair_spent_by_payer.get(key, 0) + amount_k
+
+    return paid_sum, net, members_order, pair_spent_by_payer
 
 def settle_from_net(net: dict[str, float]):
+    """Chuyển net -> danh sách giao dịch tối thiểu (debtor -> creditor)."""
     creditors = [(k, v) for k, v in net.items() if v > 0.5]
     debtors   = [(k,-v) for k, v in net.items() if v < -0.5]
     creditors.sort(key=lambda x: x[1], reverse=True)
@@ -211,7 +235,7 @@ def settle_from_net(net: dict[str, float]):
 # === Handlers ===
 async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Cách dùng (không còn '|'):\n"
+        "Cách dùng (không dùng '|'):\n"
         "• Chia TẤT CẢ:   /b 120 siêu thị  (b trả, chia đều mọi người)\n"
         "• Chia NHÓM CON: /ab 200 trưa     (a trả, chỉ a & b chia)\n"
         "                 /bcd 300 gas     (b trả, b/c/d chia)\n"
@@ -265,32 +289,52 @@ async def entry_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     con.commit(); con.close()
 
     who = f"cho {note}" if note else "(không ghi chú)"
-    suffix = f" — nhóm: {''.join(participants_inis).upper()}" if participants_inis and participants_csv else ""
+    # Phản hồi ngắn gọn, đúng mẫu bạn thích
     await update.message.reply_text(
-        f"đã ghi nhận: \"{fullname} chi {fmt_k(amount_k)} {who}\"{suffix}"
+        f"đã ghi nhận: \"{fullname} chi {fmt_k(amount_k)} {who}\""
     )
 
 async def tongket_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     set_default_map(chat_id)
+
     start = get_period_start(chat_id)
     end = datetime.now(timezone.utc)
 
-    paid_sum, net, members_order = compute_balances(chat_id, start.isoformat())
+    paid_sum, net, members_order, pair_spent = compute_balances(chat_id, start.isoformat())
+
+    # Không có khoản chi nào
     if not any(paid_sum.values()):
         await update.message.reply_text(
             f"Chi tiêu từ ngày {fmt_date_dmy(start)} đến {fmt_date_dmy(end)}:\n- (chưa có khoản chi nào)"
-        ); return
+        )
+        return
 
+    # Kết chuyển 'net' thành danh sách giao dịch tối thiểu
     moves = settle_from_net(net)
 
+    # Render: đúng kiểu bạn yêu cầu
     lines = [f"Chi tiêu từ ngày {fmt_date_dmy(start)} đến {fmt_date_dmy(end)}:"]
+
+    # 1) Tổng chi theo người
     for name in members_order:
-        lines.append(f"- {name} đã chi tiêu tổng cộng: {fmt_k(paid_sum.get(name,0))}")
+        lines.append(f"- {name} đã chi tiêu tổng cộng: {fmt_k(paid_sum.get(name, 0))}")
+
+    # 2) Các khoản riêng theo cặp (payer, other) — đã được tính trong tổng
+    #    In theo thứ tự payer, rồi other (alphabet)
+    if pair_spent:
+        for (payer, other) in sorted(pair_spent.keys(), key=lambda x: (x[0], x[1])):
+            amt = int(round(pair_spent[(payer, other)]))
+            if amt > 0:
+                lines.append(f"- {payer} đã chi tiêu ({payer}, {other}): {fmt_k(amt)}")
+
+    # 3) Cấn trừ cuối cùng
     if moves:
-        lines += [f"{a} trả {b} {fmt_k(k)}" for a,b,k in moves]
+        for a, b, k in moves:
+            lines.append(f"{a} trả {b} {fmt_k(k)}")
     else:
         lines.append("✅ Đã cân bằng")
+
     await update.message.reply_text("\n".join(lines))
 
 async def batdau_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
