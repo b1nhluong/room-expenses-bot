@@ -8,6 +8,6 @@ services:
     startCommand: bash start.sh
     envVars:
       - key: TELEGRAM_TOKEN
-        sync: false
+        sync: false   # điền sau khi tạo
       - key: WEBHOOK_SECRET
         value: secret123
